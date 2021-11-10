@@ -189,12 +189,12 @@ func (df *datafile) Write(e internal.Entry) (int64, int64, error) {
 	defer df.Unlock()
 
 	e.Offset = df.offset
-
+	// entry序列化并写入文件
 	n, err := df.enc.Encode(e)
 	if err != nil {
 		return -1, 0, err
 	}
 	df.offset += n
-
+	// 返回entry的写入位置和大小
 	return e.Offset, n, nil
 }

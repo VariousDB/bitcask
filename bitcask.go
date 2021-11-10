@@ -141,9 +141,11 @@ func (b *Bitcask) Has(key []byte) bool {
 
 // Put stores the key and value in the database.
 func (b *Bitcask) Put(key, value []byte) error {
+	// 对key的校验，非空
 	if len(key) == 0 {
 		return ErrEmptyKey
 	}
+	// 对key，value的大小的限制
 	if b.config.MaxKeySize > 0 && uint32(len(key)) > b.config.MaxKeySize {
 		return ErrKeyTooLarge
 	}
@@ -153,12 +155,14 @@ func (b *Bitcask) Put(key, value []byte) error {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// 写入活跃文件后的offset与size
 	offset, n, err := b.put(key, value)
 	if err != nil {
 		return err
 	}
-
+	// 如果强制落盘（每次put直接写磁盘）
 	if b.config.Sync {
+		// 将当前活跃文件内的缓冲数据全部刷到磁盘
 		if err := b.curr.Sync(); err != nil {
 			return err
 		}
@@ -166,11 +170,12 @@ func (b *Bitcask) Put(key, value []byte) error {
 
 	// in case of successful `put`, IndexUpToDate will be always be false
 	b.metadata.IndexUpToDate = false
-
+	// 需要更新内存索引
 	if oldItem, found := b.trie.Search(key); found {
+		// TODO ReclaimableSpace 增加item的大小，这个参数什么用
 		b.metadata.ReclaimableSpace += oldItem.(internal.Item).Size
 	}
-
+	// 建立内存索引
 	item := internal.Item{FileID: b.curr.FileID(), Offset: offset, Size: n}
 	b.trie.Insert(key, item)
 
@@ -510,28 +515,29 @@ func (b *Bitcask) Fold(f func(key []byte) error) (err error) {
 // get retrieves the value of the given key
 func (b *Bitcask) get(key []byte) (internal.Entry, error) {
 	var df data.Datafile
-
+	// 先从内存索引art树中找item
 	value, found := b.trie.Search(key)
 	if !found {
 		return internal.Entry{}, ErrKeyNotFound
 	}
+	// 判断是否已过期
 	if b.isExpired(key) {
 		return internal.Entry{}, ErrKeyExpired
 	}
 
 	item := value.(internal.Item)
-
+	// 判断此item所在的文件是否是当前活跃文件
 	if item.FileID == b.curr.FileID() {
 		df = b.curr
 	} else {
 		df = b.datafiles[item.FileID]
 	}
-
+	// 找到对应的文件，读取entry
 	e, err := df.ReadAt(item.Offset, item.Size)
 	if err != nil {
 		return internal.Entry{}, err
 	}
-
+	// 进行校验
 	checksum := crc32.ChecksumIEEE(e.Value)
 	if checksum != e.Checksum {
 		return internal.Entry{}, ErrChecksumFailed
@@ -541,18 +547,19 @@ func (b *Bitcask) get(key []byte) (internal.Entry, error) {
 }
 
 func (b *Bitcask) maybeRotate() error {
+	// 判断文件大小是否已达上限，需要关闭
 	size := b.curr.Size()
 	if size < int64(b.config.MaxDatafileSize) {
 		return nil
 	}
-
+	// 关闭旧文件
 	err := b.curr.Close()
 	if err != nil {
 		return err
 	}
-
+	// 获取关闭的文件id
 	id := b.curr.FileID()
-
+	// 创建一个readonly文件，已关闭的只读文件
 	df, err := data.NewDatafile(
 		b.path, id, true,
 		b.config.MaxKeySize,
@@ -562,10 +569,11 @@ func (b *Bitcask) maybeRotate() error {
 	if err != nil {
 		return err
 	}
-
+	// 加入dataFiles列表
 	b.datafiles[id] = df
 
 	id = b.curr.FileID() + 1
+	// 创建一个新的活跃文件
 	curr, err := data.NewDatafile(
 		b.path, id, false,
 		b.config.MaxKeySize,
@@ -575,7 +583,9 @@ func (b *Bitcask) maybeRotate() error {
 	if err != nil {
 		return err
 	}
+	// 赋值为当前活跃文件
 	b.curr = curr
+	// TODO 写内存索引，需要详细看
 	err = b.saveIndexes()
 	if err != nil {
 		return err
@@ -586,10 +596,11 @@ func (b *Bitcask) maybeRotate() error {
 
 // put inserts a new (key, value). Both key and value are valid inputs.
 func (b *Bitcask) put(key, value []byte) (int64, int64, error) {
+	// 校验：是否需要关闭旧文件，创建新的datafile
 	if err := b.maybeRotate(); err != nil {
 		return -1, 0, fmt.Errorf("error rotating active datafile: %w", err)
 	}
-
+	// 写入当前的活跃文件，返回offset，size
 	return b.curr.Write(internal.NewEntry(key, value, nil))
 }
 
@@ -817,6 +828,7 @@ func (b *Bitcask) Merge() error {
 // Open opens the database at the given path with optional options.
 // Options can be provided with the `WithXXX` functions that provide
 // configuration options as functions.
+// 打开数据库，使用options模式进行配置记载
 func Open(path string, options ...Option) (*Bitcask, error) {
 	var (
 		cfg  *config.Config
@@ -825,40 +837,45 @@ func Open(path string, options ...Option) (*Bitcask, error) {
 	)
 
 	configPath := filepath.Join(path, "config.json")
+	// 先尝试读取默认的配置文件
 	if internal.Exists(configPath) {
 		cfg, err = config.Load(configPath)
 		if err != nil {
 			return nil, &ErrBadConfig{err}
 		}
 	} else {
+		// 若不存在配置文件，则使用默认配置
 		cfg = newDefaultConfig()
 	}
-
+	// 判断是否需要版本升级
 	if err := checkAndUpgrade(cfg, configPath); err != nil {
 		return nil, err
 	}
-
+	// 使用option模式进行初始化
 	for _, opt := range options {
 		if err := opt(cfg); err != nil {
 			return nil, err
 		}
 	}
-
+	// 创建文件夹，用于存放数据库的文件
 	if err := os.MkdirAll(path, cfg.DirFileModeBeforeUmask); err != nil {
 		return nil, err
 	}
-
+	// TODO 加载数据库元数据？与配置信息有什么不同？
 	meta, err = loadMetadata(path)
 	if err != nil {
 		return nil, &ErrBadMetadata{err}
 	}
 
 	bitcask := &Bitcask{
+		// TODO 文件锁，干什么用的
 		flock:      flock.New(filepath.Join(path, lockfile)),
 		config:     cfg,
 		options:    options,
 		path:       path,
+		// 内存索引 indexer
 		indexer:    index.NewIndexer(),
+		// TODO 不明白 ttl indexer
 		ttlIndexer: index.NewTTLIndexer(),
 		metadata:   meta,
 	}
@@ -871,7 +888,7 @@ func Open(path string, options ...Option) (*Bitcask, error) {
 	if !ok {
 		return nil, ErrDatabaseLocked
 	}
-
+	// 将配置信息写入配置文件
 	if err := cfg.Save(configPath); err != nil {
 		return nil, err
 	}
