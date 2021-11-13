@@ -27,6 +27,18 @@ var (
 	ErrMockError = errors.New("error: mock error")
 )
 
+
+func TestStat(t *testing.T){
+	stat,err := os.Stat("demo")
+	if err != nil {
+		fmt.Println(err)
+		if errors.Is(err,os.ErrNotExist){
+			fmt.Println("yes")
+		}
+	}
+	fmt.Println(stat)
+}
+
 type sortByteArrays [][]byte
 
 func (b sortByteArrays) Len() int {

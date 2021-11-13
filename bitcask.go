@@ -87,15 +87,17 @@ func (b *Bitcask) Close() error {
 }
 
 func (b *Bitcask) close() error {
+	// 关闭db时：保存内存索引
 	if err := b.saveIndexes(); err != nil {
 		return err
 	}
 
 	b.metadata.IndexUpToDate = true
+	// 保存db元数据信息
 	if err := b.saveMetadata(); err != nil {
 		return err
 	}
-
+	// 将所有的old文件关闭
 	for _, df := range b.datafiles {
 		if err := df.Close(); err != nil {
 			return err
@@ -132,6 +134,7 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 func (b *Bitcask) Has(key []byte) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	// 通过在内存索引中查找即可判断是否有此key
 	_, found := b.trie.Search(key)
 	if found {
 		return !b.isExpired(key)
@@ -173,6 +176,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 	// 需要更新内存索引
 	if oldItem, found := b.trie.Search(key); found {
 		// TODO ReclaimableSpace 增加item的大小，这个参数什么用
+		// 用来评估 是否需要merge
 		b.metadata.ReclaimableSpace += oldItem.(internal.Item).Size
 	}
 	// 建立内存索引
@@ -184,6 +188,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 
 // PutWithTTL stores the key and value in the database with the given TTL
 func (b *Bitcask) PutWithTTL(key, value []byte, ttl time.Duration) error {
+	// 与常规put一样，进行kv的检验
 	if len(key) == 0 {
 		return ErrEmptyKey
 	}
@@ -193,11 +198,12 @@ func (b *Bitcask) PutWithTTL(key, value []byte, ttl time.Duration) error {
 	if b.config.MaxValueSize > 0 && uint64(len(value)) > b.config.MaxValueSize {
 		return ErrValueTooLarge
 	}
-
+	// 增加一个过期时间戳
 	expiry := time.Now().Add(ttl)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// 先写入文件
 	offset, n, err := b.putWithExpiry(key, value, expiry)
 	if err != nil {
 		return err
@@ -215,9 +221,10 @@ func (b *Bitcask) PutWithTTL(key, value []byte, ttl time.Duration) error {
 	if oldItem, found := b.trie.Search(key); found {
 		b.metadata.ReclaimableSpace += oldItem.(internal.Item).Size
 	}
-
+	// 加入内存索引art树
 	item := internal.Item{FileID: b.curr.FileID(), Offset: offset, Size: n}
 	b.trie.Insert(key, item)
+	// 在ttlIndex索引树中也添加一条记录
 	b.ttlIndex.Insert(key, expiry)
 
 	return nil
@@ -233,6 +240,7 @@ func (b *Bitcask) Delete(key []byte) error {
 // delete deletes the named key. If the key doesn't exist or an I/O error
 // occurs the error is returned.
 func (b *Bitcask) delete(key []byte) error {
+	// delete依赖put方法，通过将value设置为空，标记此记录为删除操作
 	_, _, err := b.put(key, []byte{})
 	if err != nil {
 		return err
@@ -240,6 +248,7 @@ func (b *Bitcask) delete(key []byte) error {
 	if item, found := b.trie.Search(key); found {
 		b.metadata.ReclaimableSpace += item.(internal.Item).Size + codec.MetaInfoSize + int64(len(key))
 	}
+	// 内存索引中删除key
 	b.trie.Delete(key)
 	b.ttlIndex.Delete(key)
 
@@ -442,6 +451,7 @@ func (b *Bitcask) SiftRange(start, end []byte, f func(key []byte) (bool, error))
 func (b *Bitcask) Len() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	// 获得keys的数目，直接调用tire的size方法
 	return b.trie.Size()
 }
 
@@ -486,7 +496,7 @@ func (b *Bitcask) runGC() (err error) {
 		//keysToDelete = append(keysToDelete, node.Key())
 		return true
 	})
-
+	// 删除过期key
 	keysToDelete.ForEach(func(node art.Node) (cont bool) {
 		b.delete(node.Key())
 		return true
@@ -610,7 +620,7 @@ func (b *Bitcask) putWithExpiry(key, value []byte, expiry time.Time) (int64, int
 	if err := b.maybeRotate(); err != nil {
 		return -1, 0, fmt.Errorf("error rotating active datafile: %w", err)
 	}
-
+	// 注意加入expiry字段
 	return b.curr.Write(internal.NewEntry(key, value, &expiry))
 }
 
@@ -619,8 +629,9 @@ func (b *Bitcask) closeCurrentFile() error {
 	if err := b.curr.Close(); err != nil {
 		return err
 	}
-
+	// 获取当前活跃文件的id
 	id := b.curr.FileID()
+	// 使其变为只读文件
 	df, err := data.NewDatafile(
 		b.path, id, true,
 		b.config.MaxKeySize,
@@ -630,7 +641,7 @@ func (b *Bitcask) closeCurrentFile() error {
 	if err != nil {
 		return err
 	}
-
+	// 加入关闭文件列表
 	b.datafiles[id] = df
 	return nil
 }
@@ -698,6 +709,7 @@ func (b *Bitcask) reopen() error {
 // and deleted keys removes. Duplicate key/value pairs are also removed.
 // Call this function periodically to reclaim disk space.
 func (b *Bitcask) Merge() error {
+	//TODO 重点关注merge过程
 	b.mu.Lock()
 	if b.isMerging {
 		b.mu.Unlock()
@@ -709,6 +721,7 @@ func (b *Bitcask) Merge() error {
 		b.isMerging = false
 	}()
 	b.mu.RLock()
+	// 将当前活跃文件设置为只读
 	err := b.closeCurrentFile()
 	if err != nil {
 		b.mu.RUnlock()
@@ -718,6 +731,7 @@ func (b *Bitcask) Merge() error {
 	for k := range b.datafiles {
 		filesToMerge = append(filesToMerge, k)
 	}
+	// 创建一个新的可写文件，作为active文件
 	err = b.openNewWritableFile()
 	if err != nil {
 		b.mu.RUnlock()
@@ -935,11 +949,14 @@ func (b *Bitcask) Backup(path string) error {
 }
 
 // saveIndex saves index and ttl_index currently in RAM to disk
+// 在每次put操作都会调用，在close db之前也会调用
 func (b *Bitcask) saveIndexes() error {
 	tempIdx := "temp_index"
+	// 将内存索引写入临时文件
 	if err := b.indexer.Save(b.trie, filepath.Join(b.path, tempIdx)); err != nil {
 		return err
 	}
+	// todo 为什么要先写临时文件，再rename？参考redis的数据持久化方案
 	if err := os.Rename(filepath.Join(b.path, tempIdx), filepath.Join(b.path, "index")); err != nil {
 		return err
 	}
@@ -979,7 +996,7 @@ func loadDatafiles(path string, maxKeySize uint32, maxValueSize uint64, fileMode
 	if err != nil {
 		return nil, 0, err
 	}
-
+	// 所有old文件的文件id列表
 	datafiles = make(map[int]data.Datafile, len(ids))
 	for _, id := range ids {
 		datafiles[id], err = data.NewDatafile(
@@ -1009,6 +1026,7 @@ func getSortedDatafiles(datafiles map[int]data.Datafile) []data.Datafile {
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].FileID() < out[j].FileID()
 	})
+	// 将所有old文件根据id进行排序
 	return out
 }
 
@@ -1028,11 +1046,13 @@ func loadIndexes(b *Bitcask, datafiles map[int]data.Datafile, lastID int) (art.T
 		return t, ttlIndex, nil
 	}
 	if found {
+		// lastID对应的就是活跃文件，需要将活跃文件的数据也建立索引
 		if err := loadIndexFromDatafile(t, ttlIndex, datafiles[lastID]); err != nil {
 			return nil, ttlIndex, err
 		}
 		return t, ttlIndex, nil
 	}
+	// 如果加载到内存的索引不是最新的，上次关闭前没有完全保存？那么需要重读datafiles，重建索引
 	sortedDatafiles := getSortedDatafiles(datafiles)
 	for _, df := range sortedDatafiles {
 		if err := loadIndexFromDatafile(t, ttlIndex, df); err != nil {

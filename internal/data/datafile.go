@@ -119,7 +119,7 @@ func (df *datafile) Close() error {
 	if df.w == nil {
 		return nil
 	}
-
+	// 关闭文件：sync写入磁盘
 	err := df.Sync()
 	if err != nil {
 		return err
