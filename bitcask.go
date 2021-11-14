@@ -889,7 +889,7 @@ func Open(path string, options ...Option) (*Bitcask, error) {
 		path:       path,
 		// 内存索引 indexer
 		indexer:    index.NewIndexer(),
-		// TODO 不明白 ttl indexer
+		// ttlIndexer 用来存有过期时间的索引
 		ttlIndexer: index.NewTTLIndexer(),
 		metadata:   meta,
 	}
