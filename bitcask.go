@@ -727,6 +727,11 @@ func (b *Bitcask) Merge() error {
 		b.mu.RUnlock()
 		return err
 	}
+	// 当前db索引--》对应当前数据库内的数据文件
+	// （需要为当前db创建一个新的可写文件，不妨碍写入）
+	// 创建一个新的临时db--》会创建一个active文件，用于写数据
+	// 遍历当前的db索引，访问当前db内的数据文件中，将kv写入临时db中
+	// 删除之前的数据文件，将临时db的active文件移动到当前db的数据文件目录中，重新打开，完成合并
 	filesToMerge := make([]int, 0, len(b.datafiles))
 	for k := range b.datafiles {
 		filesToMerge = append(filesToMerge, k)
